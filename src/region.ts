@@ -1179,7 +1179,7 @@ export interface KernelRangeView {
 }
 
 /** `mNNNNN` → surface seq, or null when this session has no such ref. */
-function seqOfKernelRef(refs: KernelRangeView['refs'], ref: string): number | null {
+export function seqOfKernelRef(refs: KernelRangeView['refs'], ref: string): number | null {
   const id = refs.byRef[ref]
   if (id === undefined) return null
   // Our CoreMessage ids ARE surface seqs (src/messages.ts), so the kernel's ref
@@ -1206,7 +1206,7 @@ function seqOfKernelRef(refs: KernelRangeView['refs'], ref: string): number | nu
  *   (resend keyed on the digest), so the visible copy must stay on the
  *   surface (issue #185).
  */
-function protectedSurfaceSeqs(session: Session, preserve: number): Set<number> {
+export function protectedSurfaceSeqs(session: Session, preserve: number): Set<number> {
   const nodes = session.surface.nodes
   const protectedSeqs = new Set<number>()
   // `nodes.slice(-preserve)` would protect EVERYTHING when preserve is 0

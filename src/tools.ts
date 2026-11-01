@@ -31,6 +31,7 @@ import {
   resolveSurfaceRange,
   runCompactionTransaction,
   liveCheckpointCarriersInSpan,
+  seqOfKernelRef,
   shadowedSeqsOf,
   stripOrphanedSurfaceToolMessages,
   summarySeqOfKernelBlock,
@@ -144,15 +145,15 @@ export const compressParameters = {
         startSeq: {
           required: true,
           oneOf: [
+            { type: 'string' as const, description: 'First boundary of the range: pass a drilldown mN ref ("m00306"), a surface seq ("295"), or a kernel block id ("b1", as acp_status lists — resolves to that block\'s checkpoint seq, which makes the fold a tier 2/3 distillation).' },
             { type: 'integer' as const, description: 'First surface seq of the range.' },
-            { type: 'string' as const, description: 'Seq as text; a trailing #callId fragment is ignored. A drilldown mN ref ("m00306") or a kernel block id ("b1", as acp_status lists) is also accepted — a block id resolves to that block\'s checkpoint seq, which makes the fold a tier 2/3 distillation.' },
           ],
         },
         endSeq: {
           required: true,
           oneOf: [
+            { type: 'string' as const, description: 'Inclusive last boundary of the range: pass a drilldown mN ref ("m00380"), a surface seq ("350"), or a kernel block id ("b3") — for a multi-block condense name the LAST block id (tier 2/3).' },
             { type: 'integer' as const, description: 'Inclusive last surface seq of the range.' },
-            { type: 'string' as const, description: 'Seq as text; a trailing #callId fragment is ignored. Also accepts a drilldown mN ref or a kernel block id ("b3") — for a multi-block condense name the LAST block id (tier 3).' },
           ],
         },
         summary: { type: 'string' as const, required: true, description: 'Complete technical summary replacing the range; keep paths, decisions, values verbatim. Minimum 50 characters.' },
@@ -1139,7 +1140,18 @@ async function handleStatus(env: ToolEnvironment, rawArgs: StatusArgs, exec: Too
   // VISIBLE total — no window semantics; drilldown scope/view/tool/sort/limit
   // pass through verbatim); the engine only appends the nudge decision line,
   // the DSH Surface anchor, and — in drilldown mode — the mN-vs-seq note.
-  const report = buildStatusReport(turn.state, statusMessages, defaultCountTokens, args)
+  const rawReport = buildStatusReport(turn.state, statusMessages, defaultCountTokens, args)
+  const report = rawReport
+    .replace(/\b(m\d{5,7})\u2013(m\d{5,7})\b/g, (full, r1: string, r2: string) => {
+      const s1 = seqOfKernelRef(turn.state.messageRefs, r1)
+      const s2 = seqOfKernelRef(turn.state.messageRefs, r2)
+      return s1 !== null && s2 !== null ? `${full} [seqs ${s1}..${s2}]` : full
+    })
+    .replace(/^(\s+)(m\d{5,7}\s+\([^)]+\))/gm, (full, pre: string, head: string) => {
+      const ref = head.split(/\s+/)[0]!
+      const s1 = seqOfKernelRef(turn.state.messageRefs, ref)
+      return s1 !== null ? `${pre}${head} [seq ${s1}]` : full
+    })
   const lines = [report]
   // Mirror upstream pi (`if (args.scope) return base`): a drilldown request
   // answers with the kernel report alone — the nudge decision line is an

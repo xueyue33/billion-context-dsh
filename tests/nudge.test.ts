@@ -380,3 +380,63 @@ test('M4: nudge contextBreakdown is wired to the surface (kernel path uses compu
   assert.equal(bd.summaries, 0)
   assert.ok(bd.text > 0)
 })
+
+test('M4: fragmented Tier-1 checkpoints under pressure promote buildNudge to Tier-2 span distillation', async () => {
+  // Regression for the pressure-mode T2 arithmetic deadlock: when 5+ Tier-1
+  // checkpoints fragment large uncompressed turns/snapshots into small islands,
+  // acp-kernel's pendingByTier only counted ~summary chars for T2 and stuck on T1.
+  const env = makeEnv(14000)
+  const session = Session.create('test-fragmented-t2')
+  const toolSeqPairs: Array<[number, number]> = []
+
+  for (let turn = 1; turn <= 8; turn += 1) {
+    appendTurn(session, turn)
+    appendUser(session, `turn-${turn}-runtime-snapshot ` + 's'.repeat(6000))
+    appendToolCall(session, `tool-${turn}`, `call_${turn}`, turn, 1)
+    const callSeq = Number(session.surface.nodes.at(-1)!)
+    appendToolResult(session, `tool-out-${turn} ` + 't'.repeat(6000), `call_${turn}`, turn, 1)
+    const resSeq = Number(session.surface.nodes.at(-1)!)
+    if (turn <= 6) {
+      toolSeqPairs.push([callSeq, resSeq])
+    }
+  }
+
+  const compress = toolOf(env, 'compress')
+  for (let i = 0; i < toolSeqPairs.length; i += 1) {
+    const [s, e] = toolSeqPairs[i]!
+    const res = await compress.execute(
+      {
+        content: [
+          {
+            startSeq: s,
+            endSeq: e,
+            summary: `TASK AS OF THIS BLOCK: compressed tool output ${i + 1} (${s}..${e}) with verbatim details preserved.`,
+          },
+        ],
+      },
+      fakeExec(session),
+    )
+    assert.match((res as { text: string }).text, /Compressed 1 block\(s\)/)
+  }
+
+  const outcome = buildNudge(fakeAgent(session), env, new Map(), new Map())
+  assert.ok(outcome !== null, 'nudge fires under fragmented pressure')
+  const nudgeText = JSON.stringify(outcome.message)
+  assert.match(nudgeText, /Tier 2: 6 tier-1 block\(s\) distillable/, 'promotes to Tier-2 span distillation across the 6 checkpoints')
+  const match = /startSeq:\s*(\d+),\s*endSeq:\s*(\d+)/.exec(nudgeText)
+  assert.ok(match !== null, 'renders exact startSeq/endSeq checkpoint boundaries')
+
+  const sweep = await compress.execute(
+    {
+      content: [
+        {
+          startSeq: Number(match[1]),
+          endSeq: Number(match[2]),
+          summary: 'TASK AS OF THIS BLOCK: distilled all 6 tier-1 blocks and intermediate fragmented snapshots into one Tier-2 block.',
+        },
+      ],
+    },
+    fakeExec(session),
+  )
+  assert.match((sweep as { text: string }).text, /tier 2/, 'sweeps checkpoints and intermediate shards into a single Tier-2 block')
+})

@@ -13,6 +13,7 @@ import {
   TIER3_CONDENSE_RULES,
   defaultCountTokens,
   renderNudgeText,
+  type CompressionBlock,
   type CompressionCore,
   type CompressionState,
   type ContextBreakdown,
@@ -22,10 +23,11 @@ import {
 import { createUserMessage, type UserMessage } from '@deepseek-ai/dsh-llm'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { AcpStateStore } from './state.ts'
-import { allLogMessages, eventsToCoreMessages, isCheckpointNode, surfaceEventsOf } from './messages.ts'
+import { allLogMessages, eventsToCoreMessages, extractEventText, isCheckpointNode, surfaceEventsOf } from './messages.ts'
 import {
   buildCompressibleSeqRanges,
   findOpenTurn,
+  protectedSurfaceSeqs,
   summarySeqOfKernelBlock,
   surfaceSummary,
   type KernelRangeView,
@@ -33,7 +35,7 @@ import {
   type SeqCompressibleRange,
 } from './region.ts'
 import { mediaPriceViaMeter } from './host-tokens.ts'
-import { sessionEventsOf } from './session-events.ts'
+import { eventAtOf, sessionEventsOf } from './session-events.ts'
 import { kernelConfigFor, type KernelConfigInput } from './config.ts'
 import { DEFAULT_RESOLVED, renderTemplate, type ResolvedPrompts } from './prompts.ts'
 
@@ -163,11 +165,21 @@ export function rangeTable(
   prompts: ResolvedPrompts = DEFAULT_RESOLVED,
   mediaPriceOf?: MediaPriceOf,
 ): string {
-  const ranges = buildCompressibleSeqRanges(
+  const rawRanges = buildCompressibleSeqRanges(
     session,
     kernelView,
     mediaPriceOf === undefined ? {} : { mediaPriceOf },
-  ).slice(0, 6)
+  )
+  const seen = new Set<string>()
+  const deduped = rawRanges.filter((r) => {
+    const k = `${r.start}..${r.end}`
+    if (seen.has(k)) return false
+    seen.add(k)
+    return true
+  })
+  const ranges = deduped.length <= 8
+    ? deduped
+    : [...deduped].sort((a, b) => b.tokens - a.tokens).slice(0, 8).sort((a, b) => a.start - b.start)
   // 零范围:整块省略(保留现状的提前返回与 nudge 尾部 '\n')。
   if (ranges.length === 0) return ''
   const lines = ranges.map((range) =>
@@ -278,6 +290,179 @@ export const EMERGENCY_NUDGE_MAX_PER_TURN = 3
  * emergency nudge but the per-turn budget is spent — the host uses it to log
  * why the model stops receiving nudges (issue #108 review).
  */
+interface BarrierFreeTierSpan {
+  readonly blocks: CompressionBlock[]
+  readonly firstSeq: number
+  readonly lastSeq: number
+  readonly spanTokens: number
+}
+
+/**
+ * Find the widest barrier-free span of active `sourceTier` blocks on the
+ * current surface whose endpoints satisfy DSH's `firstSeq <= lastSeq`
+ * durable compaction invariant and contain at least `minBlocks` blocks.
+ *
+ * `acp-kernel`'s `pendingByTier` only sums `countTokens(b.summary)` (~4K for
+ * 40+ blocks) and ignores the 100K–250K of fragmented turns/runtime snapshots
+ * trapped BETWEEN checkpoints — causing `if (pressure)` (`L5459`) to permanently
+ * pick fragmented T1 shards over T2 distillation. Measuring the true surface
+ * span across `startIdx..endIdx` (while splitting around `protectedSurfaceSeqs`
+ * barriers such as `<available_skills>` and `AGENTS.md`) cures both the
+ * arithmetic deadlock and guarded-row rejections.
+ */
+function findBestBarrierFreeTierSpan(
+  session: import('@deepseek-ai/dsh-session').Session,
+  state: CompressionState,
+  sourceTier: 1 | 2,
+  minBlocks: number,
+  mediaPriceOf?: MediaPriceOf,
+): BarrierFreeTierSpan | null {
+  const effectiveMin = Math.max(2, minBlocks)
+  const blockBySeq = new Map<number, CompressionBlock>()
+  for (const block of state.blocks) {
+    if (!block.active || block.tier !== sourceTier) continue
+    const seq = summarySeqOfKernelBlock(session, block.blockId)
+    if (seq !== null) blockBySeq.set(seq, block)
+  }
+  if (blockBySeq.size < effectiveMin) return null
+
+  const nodes = session.surface.nodes
+  const barriers = protectedSurfaceSeqs(session, 5)
+  const prefixTokens = new Array<number>(nodes.length + 1)
+  prefixTokens[0] = 0
+  for (let i = 0; i < nodes.length; i += 1) {
+    const seq = Number(nodes[i]!)
+    const event = eventAtOf(session, seq)
+    const textTokens = event === undefined ? 0 : defaultCountTokens(extractEventText(event))
+    const mediaTokens = mediaPriceOf === undefined ? 0 : mediaPriceOf(seq)
+    prefixTokens[i + 1] = prefixTokens[i]! + textTokens + mediaTokens
+  }
+
+  let best: BarrierFreeTierSpan | null = null
+  let hits: Array<{ idx: number; seq: number; block: CompressionBlock }> = []
+
+  const evaluateSegment = (): void => {
+    if (hits.length >= effectiveMin) {
+      for (let i = 0; i < hits.length; i += 1) {
+        for (let j = hits.length - 1; j >= i + effectiveMin - 1; j -= 1) {
+          const left = hits[i]!
+          const right = hits[j]!
+          if (left.seq > right.seq) continue
+          const spanTokens = prefixTokens[right.idx + 1]! - prefixTokens[left.idx]!
+          if (best === null || spanTokens > best.spanTokens) {
+            best = {
+              blocks: hits.slice(i, j + 1).map((h) => h.block),
+              firstSeq: left.seq,
+              lastSeq: right.seq,
+              spanTokens,
+            }
+          }
+          break
+        }
+      }
+    }
+    hits = []
+  }
+
+  for (let idx = 0; idx < nodes.length; idx += 1) {
+    const seq = Number(nodes[idx]!)
+    if (barriers.has(seq)) {
+      evaluateSegment()
+      continue
+    }
+    const block = blockBySeq.get(seq)
+    if (block !== undefined) {
+      hits.push({ idx, seq, block })
+    }
+  }
+  evaluateSegment()
+  return best
+}
+
+function maybePromoteFragmentedTierNudge(
+  nudge: NudgeDecision,
+  state: CompressionState,
+  session: import('@deepseek-ai/dsh-session').Session,
+  config: ReturnType<typeof kernelConfigFor>,
+  tokenCount: number,
+  mediaPriceOf?: MediaPriceOf,
+): NudgeDecision {
+  if (!config.tiers.enabled) return nudge
+
+  // If the kernel itself already selected T2/T3, sanitize its target blocks so
+  // the offered span never crosses a guarded row or violates `firstSeq <= lastSeq`.
+  if (nudge.tier === 2 || nudge.tier === 3) {
+    const sourceTier = nudge.tier === 2 ? 1 : 2
+    const trigger = nudge.tier === 2 ? config.tiers.tier2Trigger : config.tiers.tier3Trigger
+    const sanitized = findBestBarrierFreeTierSpan(session, state, sourceTier, Math.min(2, trigger), mediaPriceOf)
+    if (sanitized === null) return nudge
+    return {
+      ...nudge,
+      tierTargetBlocks: sanitized.blocks,
+      breakdown: nudge.breakdown
+        ? {
+            ...nudge.breakdown,
+            ...(nudge.tier === 2 ? { pendingT2: sanitized.spanTokens } : { pendingT3: sanitized.spanTokens }),
+          }
+        : nudge.breakdown,
+    }
+  }
+
+  const limit = config.modelContextLimit
+  const usage = limit > 0 ? tokenCount / limit : 0
+  const underPressure = usage >= config.nudge.maxContextLimitPct || usage >= config.nudge.emergencyThresholdPct
+  if (!nudge.shouldInject && !underPressure) return nudge
+
+  const minBenefit = config.nudge.minPressureBenefitTokens ?? Math.max(5000, Math.round(limit * 0.01))
+  const t1Ranges = buildCompressibleSeqRanges(
+    session,
+    kernelRangeViewOf(nudge, state),
+    mediaPriceOf === undefined ? {} : { mediaPriceOf },
+  )
+  const topSingleT1Tokens = t1Ranges.reduce((max, r) => (r.tokens > max ? r.tokens : max), 0)
+
+  const normalizeTrigger = (value: number): number => (value > 20 ? 6 : Math.max(2, value))
+  const candidates: Array<{ sourceTier: 1 | 2; targetTier: 2 | 3; trigger: number }> = [
+    { sourceTier: 2, targetTier: 3, trigger: normalizeTrigger(config.tiers.tier3Trigger) },
+    { sourceTier: 1, targetTier: 2, trigger: normalizeTrigger(config.tiers.tier2Trigger) },
+  ]
+  for (const { sourceTier, targetTier, trigger } of candidates) {
+    const span = findBestBarrierFreeTierSpan(session, state, sourceTier, trigger, mediaPriceOf)
+    if (span === null) continue
+    if (span.spanTokens >= minBenefit && span.spanTokens > topSingleT1Tokens * 1.5) {
+      return {
+        ...nudge,
+        shouldInject: true,
+        tier: targetTier,
+        tierTargetBlocks: span.blocks,
+        reason: `T${targetTier} fragmented-span distill: ${span.blocks.length} tier-${sourceTier} blocks (~${span.spanTokens} surface tokens across seq ${span.firstSeq}..${span.lastSeq})`,
+        breakdown: nudge.breakdown
+          ? {
+              ...nudge.breakdown,
+              ...(targetTier === 2 ? { pendingT2: span.spanTokens } : { pendingT3: span.spanTokens }),
+            }
+          : nudge.breakdown,
+      }
+    }
+  }
+  return nudge
+}
+
+function orderedSummarySeqsOf(
+  session: import('@deepseek-ai/dsh-session').Session,
+  targets: readonly CompressionBlock[],
+): number[] {
+  const indexBySeq = new Map<number, number>()
+  const nodes = session.surface.nodes
+  for (let i = 0; i < nodes.length; i += 1) {
+    indexBySeq.set(Number(nodes[i]!), i)
+  }
+  return targets
+    .map((block) => summarySeqOfKernelBlock(session, block.blockId))
+    .filter((seq): seq is number => seq != null)
+    .sort((a, b) => (indexBySeq.get(a) ?? a) - (indexBySeq.get(b) ?? b))
+}
+
 export function buildNudge(
   agent: Agent,
   env: NudgeEnvironment,
@@ -297,12 +482,13 @@ export function buildNudge(
   const turn = env.kernel.processTurn({ messages: coreMessages, state, config, tokenCount })
   env.store.set(session, turn.state)
 
-  const nudge = turn.nudge
-  if (nudge === undefined || !nudge.shouldInject) return null
+  if (turn.nudge === undefined) return null
   // Media-bearing spans are invisible to every text estimator, so their price
   // comes from the host meter. Lazily: a media-free session never pays for a
   // measurement (meterMediaPriceResolver only measures on first lookup).
   const mediaPriceOf = meterMediaPriceResolver(agent, session)
+  const nudge = maybePromoteFragmentedTierNudge(turn.nudge, turn.state, session, config, tokenCount, mediaPriceOf)
+  if (!nudge.shouldInject) return null
   // The kernel computed `contextBreakdown` from the FULL log (allLogMessages),
   // so after any compression it reports HISTORICAL totals (a huge `tool` that
   // is really the compressed-away originals). Override it with the visible
@@ -483,10 +669,7 @@ function replaceTierTrigger(
   const next = rest.match(/\n\nHOW TO COMPRESS/)
   const end = next !== null ? start + 2 + next.index! : text.length
   const targets = nudge.tierTargetBlocks!
-  const summarySeqs = targets
-    .map((block) => summarySeqOfKernelBlock(session, block.blockId))
-    .filter((seq): seq is number => seq != null)
-    .sort((a, b) => a - b)
+  const summarySeqs = orderedSummarySeqsOf(session, targets)
   const pending = nudge.tier === 2 ? nudge.breakdown?.pendingT2 : nudge.breakdown?.pendingT3
   const tokens = typeof pending === 'number' ? pending : 0
   const tierValue = nudge.tier === null ? 2 : nudge.tier
@@ -559,10 +742,7 @@ function renderNudgeFromTemplates(
   // Tier line (distillation / condensation suggestion) + tier-specific rules.
   if ((nudge.tier === 2 || nudge.tier === 3) && (nudge.tierTargetBlocks?.length ?? 0) > 0) {
     const targets = nudge.tierTargetBlocks!
-    const summarySeqs = targets
-      .map((block) => summarySeqOfKernelBlock(session, block.blockId))
-      .filter((seq): seq is number => seq != null)
-      .sort((a, b) => a - b)
+    const summarySeqs = orderedSummarySeqsOf(session, targets)
     const pending = nudge.tier === 2 ? nudge.breakdown?.pendingT2 : nudge.breakdown?.pendingT3
     const tokens = typeof pending === 'number' ? pending : 0
     const tierLine = renderTemplate(prompts.nudge.tier, {

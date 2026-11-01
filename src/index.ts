@@ -636,9 +636,24 @@ export class AcpCompactionEngine extends CompactionEngine {
     // restart. Register eagerly, then re-attempt when the service appears
     // (`internal/service`) or the app finishes booting (`ready`); guard so a
     // late callback never double-registers.
+    const registerToolsOn = (registry: NonNullable<ReturnType<typeof ctx.get<'tools'>>>): void => {
+      const disposers: Array<(() => void) | void> = []
+      for (const tool of makeTools(env)) {
+        try {
+          disposers.push(registry.register(tool))
+        } catch (err) {
+          this.ctx.logger.warn(`billion-context-dsh: failed to register tool ${tool.name}: ${String(err)}`)
+        }
+      }
+      ctx.effect(() => () => {
+        for (const d of disposers) {
+          try { d?.() } catch {}
+        }
+      }, 'billion-context-dsh: model tools')
+    }
     const tools = ctx.get('tools')
     if (tools !== undefined) {
-      for (const tool of makeTools(env)) tools.register(tool)
+      registerToolsOn(tools)
     } else {
       let done = false
       const registerTools = (): void => {
@@ -646,15 +661,31 @@ export class AcpCompactionEngine extends CompactionEngine {
         const registry = ctx.get('tools')
         if (registry === undefined) return
         done = true
-        for (const tool of makeTools(env)) registry.register(tool)
+        registerToolsOn(registry)
       }
       ctx.on('internal/service', (name: unknown) => {
         if (name === 'tools') registerTools()
       })
     }
+    ctx.on('internal/service', (name: unknown) => {
+      if (name === 'tools') {
+        const registry = ctx.get('tools')
+        if (registry !== undefined && registry.get('compress') === undefined) {
+          registerToolsOn(registry)
+        }
+      }
+    })
+    const registerCommandOn = (registry: NonNullable<ReturnType<typeof ctx.get<'commands'>>>): void => {
+      try {
+        const d = registry.register(acpCommand(env))
+        ctx.effect(() => () => { try { d?.() } catch {} }, 'billion-context-dsh: command')
+      } catch (err) {
+        this.ctx.logger.warn(`billion-context-dsh: failed to register command: ${String(err)}`)
+      }
+    }
     const commands = ctx.get('commands')
     if (commands !== undefined) {
-      commands.register(acpCommand(env))
+      registerCommandOn(commands)
     } else {
       let done = false
       const registerCommand = (): void => {
@@ -662,7 +693,7 @@ export class AcpCompactionEngine extends CompactionEngine {
         const registry = ctx.get('commands')
         if (registry === undefined) return
         done = true
-        registry.register(acpCommand(env))
+        registerCommandOn(registry)
       }
       ctx.on('internal/service', (name: unknown) => {
         if (name === 'commands') registerCommand()

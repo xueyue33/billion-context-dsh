@@ -216,40 +216,14 @@ export const DEFAULT_PROMPTS: ResolvedPrompts = {
   },
   systemPromptTemplate: `Active Context Pruning — model-driven context management
 
-YOU decide whether and when to compress context. The nudge is an efficiency notification: when you see one, consider which ranges you have genuinely consumed and could summarise to keep working context lean.
+Compress consumed ranges (tool outputs, dead-end exploration, completed subtasks) when context reaches the configured threshold; keep active working content and open user objectives uncompressed.
 
-{philosophy}
-
-WHEN TO COMPRESS:
-- A sub-agent or delegated task has returned a large result that you have already extracted the key facts from.
-- Verbose command output (build/test logs, git diff, directory listings) where you have already used the information you need.
-- Exploration that led nowhere.
-- Repeated reads of the same file or repeated status checks once the decision is recorded.
-- Resolved discussion threads where a decision has been captured in summary or in code.
-- Intermediate steps of a completed multi-step task, once the final result is recorded.
-- A task phase has ended — bug hunt complete, root cause found, exploration done, research sprint wrapped.
-
-WHEN NOT TO COMPRESS:
-- Content the current step is actively reading or reasoning about.
-- Important user messages — preserve their exact intent, constraints, and acceptance criteria.
-- Protected tool outputs — hard-excluded from compression ranges, survive intact in visible context.
-- Content you will still need to cite verbatim — in review/audit/verification tasks, keep source reads un-compressed until the final report is written. If you compressed it and now need the exact detail, decompress costs a full round-trip; prefer delaying the compress.
-
-{howToCompressRules}
-
-Compression tools (refs are SURFACE SEQS, not ids):
-- compress: replace one or more seq ranges, each with your own dense summary. Single range: compress({ content: [{ startSeq, endSeq, summary }] }). Batch multiple unrelated segments in one call (each entry becomes its own block): compress({ content: [{ startSeq: 1, endSeq: 5, summary: '...' }, { startSeq: 12, endSeq: 18, summary: '...' }] }). Keep ranges disjoint — overlapping entries in one batch are skipped. Edges are auto-balanced to tool-call/result boundaries; a trailing #callId fragment in a seq is ignored. Seq refs must be on the current surface: seqs from older nudges or earlier compresses go stale as the surface moves, so a stale span is auto-remapped to its still-live remainder (the result reports the adjusted span), a fully compressed span is reported as already compressed, and invented/other-session seqs fail with guidance. The block refs (bN, e.g. b1) in acp_status COMPRESSED BLOCKS are for decompress, NOT compress boundaries.
-- decompress: recover a compressed block's original content, read-only. decompress({ blockId }) — accept the bN ref shown by acp_status (e.g. b1) or a compaction id. Large blocks page (each page sized to stay under the host tool-result trim budget, up to 100 messages): pass offset/limit and follow the continue hint in the result.
-- search_context: when a summary lacks the details you need (exact values, error strings, decisions, verbatim code), SEARCH the compressed blocks FIRST — never guess or reconstruct from memory; search_context(query) locates the right block, decompress only that block.
-- acp_status: current context usage and the live compressible-range list. Run it right before compressing — the only seqs that never go stale are the ones you just read. Drilldown (scope/view/tool/sort/limit) lists per-message or per-block sizes; drilldown rows are kernel ids (mN) — compress accepts them directly (auto-mapped to the live surface seq).
-
-Tiered compression: each compressed block appears on the surface as one summary node. Compressing that node again DISTILLS the block (tier 2): the parent summary folds into your new summary and the original messages are freed. Distilling a tier-2 block yields tier 3. Distill when a summary itself is consumed — decompress on the tier-2 block recovers the full originals.
-
-{tier2DistillRules}
-
-{tier3CondenseRules}
-
-When you write a summary, it becomes the ONLY record of that range: keep file paths, signatures, exact values, decisions, and error strings verbatim so a later reader (or you, after decompress) can continue without the original. A mid-task compression must also hand off STATE, not just facts: where you are in the task and what remains (open TODOs), which approaches you already ruled out (dead ends), and which intermediate artifacts are already done and where they live — so the next step continues instead of re-running work you already did. Never reuse historical seqs — the surface moves as messages land and compress; verify with acp_status.`,
+WHEN WRITING A COMPRESSION SUMMARY (compress tool):
+- Make the summary self-contained so work can continue without the original messages; label recorded task state as historical (TASK AS OF THIS BLOCK: ...).
+- Keep verbatim: full file paths with line numbers (dir/file.py:45), function/type signatures, exact error strings, config keys/values/thresholds, decisions with rationale ("chose X over Y because Z"), and message refs (m00132).
+- Carry forward any unresolved user objectives (Open objectives: ... (mNNNNN)) and remaining TODOs.
+- Drop verbose logs, duplicate file reads, and spent intermediate tool outputs (summarize dropped scripts/analyses in one line).
+- Tools: acp_status (inspect live surface seqs, block ids bN, or drilldown mN refs), compress({ content: [{ startSeq, endSeq, summary }] }) (pass disjoint surface seqs, mN refs, or block ids startSeq:"bN", endSeq:"bM" to distill multiple blocks + intermediate raw shards into one Tier 2/3 block), search_context({ query }) (search compressed blocks), decompress({ blockId }) (recover original messages by bN ref).`,
 }
 
 /** 模块级默认缓存:默认参/兜底直接引用,避免每次调用重跑校验。 */
