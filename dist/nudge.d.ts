@@ -90,19 +90,6 @@ export declare function computeSurfaceBreakdown(state: CompressionState, message
  * user turn). Normal-pressure nudges remain limited to one per turn regardless.
  */
 export declare const EMERGENCY_NUDGE_MAX_PER_TURN = 3;
-/**
- * Decide and build one nudge message for the agent's next pre-step. Returns
- * null when the kernel recommends no nudge or the per-turn budget is spent:
- * normal-pressure nudges fire at most once per user turn, and emergency nudges
- * are capped at {@link EMERGENCY_NUDGE_MAX_PER_TURN} per user turn so an
- * unrelieved ≥threshold pressure cannot re-inject a durable nudge on every
- * pre-step forever (issue #108). Also advances the in-memory kernel state (ref
- * assignment) so the compress tool can resolve seq → mNNNNN refs.
- *
- * `onEmergencyCapHit` (optional) fires when the kernel still wants an
- * emergency nudge but the per-turn budget is spent — the host uses it to log
- * why the model stops receiving nudges (issue #108 review).
- */
 export declare function buildNudge(agent: Agent, env: NudgeEnvironment, lastNudgeTurn: Map<string, number>, emergencyNudges: Map<string, {
     turn: number;
     count: number;

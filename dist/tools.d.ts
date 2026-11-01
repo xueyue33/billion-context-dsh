@@ -69,21 +69,21 @@ export declare const compressParameters: {
                 readonly startSeq: {
                     readonly required: true;
                     readonly oneOf: readonly [{
+                        readonly type: 'string';
+                        readonly description: 'First boundary of the range: pass a drilldown mN ref ("m00306"), a surface seq ("295"), or a kernel block id ("b1", as acp_status lists — resolves to that block\'s checkpoint seq, which makes the fold a tier 2/3 distillation).';
+                    }, {
                         readonly type: 'integer';
                         readonly description: 'First surface seq of the range.';
-                    }, {
-                        readonly type: 'string';
-                        readonly description: 'Seq as text; a trailing #callId fragment is ignored. A drilldown mN ref ("m00306") or a kernel block id ("b1", as acp_status lists) is also accepted — a block id resolves to that block\'s checkpoint seq, which makes the fold a tier 2/3 distillation.';
                     }];
                 };
                 readonly endSeq: {
                     readonly required: true;
                     readonly oneOf: readonly [{
+                        readonly type: 'string';
+                        readonly description: 'Inclusive last boundary of the range: pass a drilldown mN ref ("m00380"), a surface seq ("350"), or a kernel block id ("b3") — for a multi-block condense name the LAST block id (tier 2/3).';
+                    }, {
                         readonly type: 'integer';
                         readonly description: 'Inclusive last surface seq of the range.';
-                    }, {
-                        readonly type: 'string';
-                        readonly description: 'Seq as text; a trailing #callId fragment is ignored. Also accepts a drilldown mN ref or a kernel block id ("b3") — for a multi-block condense name the LAST block id (tier 3).';
                     }];
                 };
                 readonly summary: {

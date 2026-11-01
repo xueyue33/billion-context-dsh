@@ -357,6 +357,24 @@ export interface KernelRangeView {
         readonly byRef: Readonly<Record<string, string>>;
     };
 }
+/** `mNNNNN` → surface seq, or null when this session has no such ref. */
+export declare function seqOfKernelRef(refs: KernelRangeView['refs'], ref: string): number | null;
+/**
+ * Surface seqs the range table must never offer, in two roles: they are skipped
+ * when scanning a span AND they split it, because a span that reaches across
+ * one would shadow it. Three sources:
+ *
+ * - the recent tail (`preserveRecent`, default 5) — cheap protection for the
+ *   messages the current step is still working with;
+ * - the last REAL user turn (never an injected row — see `isRealUserTurn`);
+ * - the newest instruction row of every scope: the host re-injects the current
+ *   copy of an instruction file the moment it disappears from the surface, so
+ *   folding it reclaims nothing (rule 16);
+ * - the newest skill-catalog row: the host never re-sends a folded catalog
+ *   (resend keyed on the digest), so the visible copy must stay on the
+ *   surface (issue #185).
+ */
+export declare function protectedSurfaceSeqs(session: Session, preserve: number): Set<number>;
 /**
  * Compressible spans in the DSH seq dialect, for the nudge range table.
  *

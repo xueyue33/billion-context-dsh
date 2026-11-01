@@ -7896,40 +7896,14 @@ var DEFAULT_PROMPTS = {
   },
   systemPromptTemplate: `Active Context Pruning \u2014 model-driven context management
 
-YOU decide whether and when to compress context. The nudge is an efficiency notification: when you see one, consider which ranges you have genuinely consumed and could summarise to keep working context lean.
+Compress consumed ranges (tool outputs, dead-end exploration, completed subtasks) when context reaches the configured threshold; keep active working content and open user objectives uncompressed.
 
-{philosophy}
-
-WHEN TO COMPRESS:
-- A sub-agent or delegated task has returned a large result that you have already extracted the key facts from.
-- Verbose command output (build/test logs, git diff, directory listings) where you have already used the information you need.
-- Exploration that led nowhere.
-- Repeated reads of the same file or repeated status checks once the decision is recorded.
-- Resolved discussion threads where a decision has been captured in summary or in code.
-- Intermediate steps of a completed multi-step task, once the final result is recorded.
-- A task phase has ended \u2014 bug hunt complete, root cause found, exploration done, research sprint wrapped.
-
-WHEN NOT TO COMPRESS:
-- Content the current step is actively reading or reasoning about.
-- Important user messages \u2014 preserve their exact intent, constraints, and acceptance criteria.
-- Protected tool outputs \u2014 hard-excluded from compression ranges, survive intact in visible context.
-- Content you will still need to cite verbatim \u2014 in review/audit/verification tasks, keep source reads un-compressed until the final report is written. If you compressed it and now need the exact detail, decompress costs a full round-trip; prefer delaying the compress.
-
-{howToCompressRules}
-
-Compression tools (refs are SURFACE SEQS, not ids):
-- compress: replace one or more seq ranges, each with your own dense summary. Single range: compress({ content: [{ startSeq, endSeq, summary }] }). Batch multiple unrelated segments in one call (each entry becomes its own block): compress({ content: [{ startSeq: 1, endSeq: 5, summary: '...' }, { startSeq: 12, endSeq: 18, summary: '...' }] }). Keep ranges disjoint \u2014 overlapping entries in one batch are skipped. Edges are auto-balanced to tool-call/result boundaries; a trailing #callId fragment in a seq is ignored. Seq refs must be on the current surface: seqs from older nudges or earlier compresses go stale as the surface moves, so a stale span is auto-remapped to its still-live remainder (the result reports the adjusted span), a fully compressed span is reported as already compressed, and invented/other-session seqs fail with guidance. The block refs (bN, e.g. b1) in acp_status COMPRESSED BLOCKS are for decompress, NOT compress boundaries.
-- decompress: recover a compressed block's original content, read-only. decompress({ blockId }) \u2014 accept the bN ref shown by acp_status (e.g. b1) or a compaction id. Large blocks page (each page sized to stay under the host tool-result trim budget, up to 100 messages): pass offset/limit and follow the continue hint in the result.
-- search_context: when a summary lacks the details you need (exact values, error strings, decisions, verbatim code), SEARCH the compressed blocks FIRST \u2014 never guess or reconstruct from memory; search_context(query) locates the right block, decompress only that block.
-- acp_status: current context usage and the live compressible-range list. Run it right before compressing \u2014 the only seqs that never go stale are the ones you just read. Drilldown (scope/view/tool/sort/limit) lists per-message or per-block sizes; drilldown rows are kernel ids (mN) \u2014 compress accepts them directly (auto-mapped to the live surface seq).
-
-Tiered compression: each compressed block appears on the surface as one summary node. Compressing that node again DISTILLS the block (tier 2): the parent summary folds into your new summary and the original messages are freed. Distilling a tier-2 block yields tier 3. Distill when a summary itself is consumed \u2014 decompress on the tier-2 block recovers the full originals.
-
-{tier2DistillRules}
-
-{tier3CondenseRules}
-
-When you write a summary, it becomes the ONLY record of that range: keep file paths, signatures, exact values, decisions, and error strings verbatim so a later reader (or you, after decompress) can continue without the original. A mid-task compression must also hand off STATE, not just facts: where you are in the task and what remains (open TODOs), which approaches you already ruled out (dead ends), and which intermediate artifacts are already done and where they live \u2014 so the next step continues instead of re-running work you already did. Never reuse historical seqs \u2014 the surface moves as messages land and compress; verify with acp_status.`
+WHEN WRITING A COMPRESSION SUMMARY (compress tool):
+- Make the summary self-contained so work can continue without the original messages; label recorded task state as historical (TASK AS OF THIS BLOCK: ...).
+- Keep verbatim: full file paths with line numbers (dir/file.py:45), function/type signatures, exact error strings, config keys/values/thresholds, decisions with rationale ("chose X over Y because Z"), and message refs (m00132).
+- Carry forward any unresolved user objectives (Open objectives: ... (mNNNNN)) and remaining TODOs.
+- Drop verbose logs, duplicate file reads, and spent intermediate tool outputs (summarize dropped scripts/analyses in one line).
+- Tools: acp_status (inspect live surface seqs, block ids bN, or drilldown mN refs), compress({ content: [{ startSeq, endSeq, summary }] }) (pass disjoint surface seqs, mN refs, or block ids startSeq:"bN", endSeq:"bM" to distill multiple blocks + intermediate raw shards into one Tier 2/3 block), search_context({ query }) (search compressed blocks), decompress({ blockId }) (recover original messages by bN ref).`
 };
 var DEFAULT_RESOLVED = DEFAULT_PROMPTS;
 
@@ -7967,11 +7941,19 @@ function meterMediaPriceResolver(agent, session) {
   };
 }
 function rangeTable(session, kernelView, prompts = DEFAULT_RESOLVED, mediaPriceOf) {
-  const ranges = buildCompressibleSeqRanges(
+  const rawRanges = buildCompressibleSeqRanges(
     session,
     kernelView,
     mediaPriceOf === void 0 ? {} : { mediaPriceOf }
-  ).slice(0, 6);
+  );
+  const seen = /* @__PURE__ */ new Set();
+  const deduped = rawRanges.filter((r) => {
+    const k = `${r.start}..${r.end}`;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+  const ranges = deduped.length <= 8 ? deduped : [...deduped].sort((a, b) => b.tokens - a.tokens).slice(0, 8).sort((a, b) => a.start - b.start);
   if (ranges.length === 0) return "";
   const lines = ranges.map(
     (range) => renderTemplate(prompts.rangeTable.line, {
@@ -8020,6 +8002,123 @@ function computeSurfaceBreakdown(state, messages, total, growth) {
   return { system, tool, summaries, code, text, total, growth };
 }
 var EMERGENCY_NUDGE_MAX_PER_TURN = 3;
+function findBestBarrierFreeTierSpan(session, state, sourceTier, minBlocks, mediaPriceOf) {
+  const effectiveMin = Math.max(2, minBlocks);
+  const blockBySeq = /* @__PURE__ */ new Map();
+  for (const block of state.blocks) {
+    if (!block.active || block.tier !== sourceTier) continue;
+    const seq = summarySeqOfKernelBlock(session, block.blockId);
+    if (seq !== null) blockBySeq.set(seq, block);
+  }
+  if (blockBySeq.size < effectiveMin) return null;
+  const nodes = session.surface.nodes;
+  const barriers = protectedSurfaceSeqs(session, 5);
+  const prefixTokens = new Array(nodes.length + 1);
+  prefixTokens[0] = 0;
+  for (let i = 0; i < nodes.length; i += 1) {
+    const seq = Number(nodes[i]);
+    const event = eventAtOf(session, seq);
+    const textTokens = event === void 0 ? 0 : defaultCountTokens(extractEventText(event));
+    const mediaTokens = mediaPriceOf === void 0 ? 0 : mediaPriceOf(seq);
+    prefixTokens[i + 1] = prefixTokens[i] + textTokens + mediaTokens;
+  }
+  let best = null;
+  let hits = [];
+  const evaluateSegment = () => {
+    if (hits.length >= effectiveMin) {
+      for (let i = 0; i < hits.length; i += 1) {
+        for (let j = hits.length - 1; j >= i + effectiveMin - 1; j -= 1) {
+          const left = hits[i];
+          const right = hits[j];
+          if (left.seq > right.seq) continue;
+          const spanTokens = prefixTokens[right.idx + 1] - prefixTokens[left.idx];
+          if (best === null || spanTokens > best.spanTokens) {
+            best = {
+              blocks: hits.slice(i, j + 1).map((h) => h.block),
+              firstSeq: left.seq,
+              lastSeq: right.seq,
+              spanTokens
+            };
+          }
+          break;
+        }
+      }
+    }
+    hits = [];
+  };
+  for (let idx = 0; idx < nodes.length; idx += 1) {
+    const seq = Number(nodes[idx]);
+    if (barriers.has(seq)) {
+      evaluateSegment();
+      continue;
+    }
+    const block = blockBySeq.get(seq);
+    if (block !== void 0) {
+      hits.push({ idx, seq, block });
+    }
+  }
+  evaluateSegment();
+  return best;
+}
+function maybePromoteFragmentedTierNudge(nudge, state, session, config, tokenCount, mediaPriceOf) {
+  if (!config.tiers.enabled) return nudge;
+  if (nudge.tier === 2 || nudge.tier === 3) {
+    const sourceTier = nudge.tier === 2 ? 1 : 2;
+    const trigger = nudge.tier === 2 ? config.tiers.tier2Trigger : config.tiers.tier3Trigger;
+    const sanitized = findBestBarrierFreeTierSpan(session, state, sourceTier, Math.min(2, trigger), mediaPriceOf);
+    if (sanitized === null) return nudge;
+    return {
+      ...nudge,
+      tierTargetBlocks: sanitized.blocks,
+      breakdown: nudge.breakdown ? {
+        ...nudge.breakdown,
+        ...nudge.tier === 2 ? { pendingT2: sanitized.spanTokens } : { pendingT3: sanitized.spanTokens }
+      } : nudge.breakdown
+    };
+  }
+  const limit = config.modelContextLimit;
+  const usage = limit > 0 ? tokenCount / limit : 0;
+  const underPressure = usage >= config.nudge.maxContextLimitPct || usage >= config.nudge.emergencyThresholdPct;
+  if (!nudge.shouldInject && !underPressure) return nudge;
+  const minBenefit = config.nudge.minPressureBenefitTokens ?? Math.max(5e3, Math.round(limit * 0.01));
+  const t1Ranges = buildCompressibleSeqRanges(
+    session,
+    kernelRangeViewOf(nudge, state),
+    mediaPriceOf === void 0 ? {} : { mediaPriceOf }
+  );
+  const topSingleT1Tokens = t1Ranges.reduce((max, r) => r.tokens > max ? r.tokens : max, 0);
+  const normalizeTrigger = (value) => value > 20 ? 6 : Math.max(2, value);
+  const candidates = [
+    { sourceTier: 2, targetTier: 3, trigger: normalizeTrigger(config.tiers.tier3Trigger) },
+    { sourceTier: 1, targetTier: 2, trigger: normalizeTrigger(config.tiers.tier2Trigger) }
+  ];
+  for (const { sourceTier, targetTier, trigger } of candidates) {
+    const span = findBestBarrierFreeTierSpan(session, state, sourceTier, trigger, mediaPriceOf);
+    if (span === null) continue;
+    if (span.spanTokens >= minBenefit && span.spanTokens > topSingleT1Tokens * 1.5) {
+      return {
+        ...nudge,
+        shouldInject: true,
+        tier: targetTier,
+        tierTargetBlocks: span.blocks,
+        reason: `T${targetTier} fragmented-span distill: ${span.blocks.length} tier-${sourceTier} blocks (~${span.spanTokens} surface tokens across seq ${span.firstSeq}..${span.lastSeq})`,
+        breakdown: nudge.breakdown ? {
+          ...nudge.breakdown,
+          ...targetTier === 2 ? { pendingT2: span.spanTokens } : { pendingT3: span.spanTokens }
+        } : nudge.breakdown
+      };
+    }
+  }
+  return nudge;
+}
+function orderedSummarySeqsOf(session, targets) {
+  const indexBySeq = /* @__PURE__ */ new Map();
+  const nodes = session.surface.nodes;
+  for (let i = 0; i < nodes.length; i += 1) {
+    indexBySeq.set(Number(nodes[i]), i);
+  }
+  return targets.map((block) => summarySeqOfKernelBlock(session, block.blockId)).filter((seq) => seq != null).sort((a, b) => (indexBySeq.get(a) ?? a) - (indexBySeq.get(b) ?? b));
+}
 function buildNudge(agent, env, lastNudgeTurn, emergencyNudges, onEmergencyCapHit) {
   const session = agent.session;
   const state = env.store.stateFor(session);
@@ -8030,9 +8129,10 @@ function buildNudge(agent, env, lastNudgeTurn, emergencyNudges, onEmergencyCapHi
   const config = kernelConfigFor(env);
   const turn = env.kernel.processTurn({ messages: coreMessages, state, config, tokenCount });
   env.store.set(session, turn.state);
-  const nudge = turn.nudge;
-  if (nudge === void 0 || !nudge.shouldInject) return null;
+  if (turn.nudge === void 0) return null;
   const mediaPriceOf = meterMediaPriceResolver(agent, session);
+  const nudge = maybePromoteFragmentedTierNudge(turn.nudge, turn.state, session, config, tokenCount, mediaPriceOf);
+  if (!nudge.shouldInject) return null;
   const statusMessages = eventsToCoreMessages(
     surfaceEvents.filter((event) => isCheckpointNode(event) === false)
   );
@@ -8117,7 +8217,7 @@ function replaceTierTrigger(text, nudge, session, prompts) {
   const next = rest.match(/\n\nHOW TO COMPRESS/);
   const end = next !== null ? start + 2 + next.index : text.length;
   const targets = nudge.tierTargetBlocks;
-  const summarySeqs = targets.map((block) => summarySeqOfKernelBlock(session, block.blockId)).filter((seq) => seq != null).sort((a, b) => a - b);
+  const summarySeqs = orderedSummarySeqsOf(session, targets);
   const pending = nudge.tier === 2 ? nudge.breakdown?.pendingT2 : nudge.breakdown?.pendingT3;
   const tokens = typeof pending === "number" ? pending : 0;
   const tierValue = nudge.tier === null ? 2 : nudge.tier;
@@ -8165,7 +8265,7 @@ function renderNudgeFromTemplates(nudge, emergency, session, kernelView, prompts
   if (prompts.nudge.guidance !== "") parts.push("", prompts.nudge.guidance);
   if ((nudge.tier === 2 || nudge.tier === 3) && (nudge.tierTargetBlocks?.length ?? 0) > 0) {
     const targets = nudge.tierTargetBlocks;
-    const summarySeqs = targets.map((block) => summarySeqOfKernelBlock(session, block.blockId)).filter((seq) => seq != null).sort((a, b) => a - b);
+    const summarySeqs = orderedSummarySeqsOf(session, targets);
     const pending = nudge.tier === 2 ? nudge.breakdown?.pendingT2 : nudge.breakdown?.pendingT3;
     const tokens = typeof pending === "number" ? pending : 0;
     const tierLine = renderTemplate(prompts.nudge.tier, {
@@ -8298,15 +8398,15 @@ var compressParameters = {
         startSeq: {
           required: true,
           oneOf: [
-            { type: "integer", description: "First surface seq of the range." },
-            { type: "string", description: `Seq as text; a trailing #callId fragment is ignored. A drilldown mN ref ("m00306") or a kernel block id ("b1", as acp_status lists) is also accepted \u2014 a block id resolves to that block's checkpoint seq, which makes the fold a tier 2/3 distillation.` }
+            { type: "string", description: `First boundary of the range: pass a drilldown mN ref ("m00306"), a surface seq ("295"), or a kernel block id ("b1", as acp_status lists \u2014 resolves to that block's checkpoint seq, which makes the fold a tier 2/3 distillation).` },
+            { type: "integer", description: "First surface seq of the range." }
           ]
         },
         endSeq: {
           required: true,
           oneOf: [
-            { type: "integer", description: "Inclusive last surface seq of the range." },
-            { type: "string", description: 'Seq as text; a trailing #callId fragment is ignored. Also accepts a drilldown mN ref or a kernel block id ("b3") \u2014 for a multi-block condense name the LAST block id (tier 3).' }
+            { type: "string", description: 'Inclusive last boundary of the range: pass a drilldown mN ref ("m00380"), a surface seq ("350"), or a kernel block id ("b3") \u2014 for a multi-block condense name the LAST block id (tier 2/3).' },
+            { type: "integer", description: "Inclusive last surface seq of the range." }
           ]
         },
         summary: { type: "string", required: true, description: "Complete technical summary replacing the range; keep paths, decisions, values verbatim. Minimum 50 characters." },
@@ -8873,7 +8973,16 @@ async function handleStatus(env, rawArgs, exec) {
     surface.filter((event) => isCheckpointNode(event) === false),
     toolNames
   );
-  const report = buildStatusReport(turn.state, statusMessages, defaultCountTokens, args);
+  const rawReport = buildStatusReport(turn.state, statusMessages, defaultCountTokens, args);
+  const report = rawReport.replace(/\b(m\d{5,7})\u2013(m\d{5,7})\b/g, (full, r1, r2) => {
+    const s1 = seqOfKernelRef(turn.state.messageRefs, r1);
+    const s2 = seqOfKernelRef(turn.state.messageRefs, r2);
+    return s1 !== null && s2 !== null ? `${full} [seqs ${s1}..${s2}]` : full;
+  }).replace(/^(\s+)(m\d{5,7}\s+\([^)]+\))/gm, (full, pre, head) => {
+    const ref = head.split(/\s+/)[0];
+    const s1 = seqOfKernelRef(turn.state.messageRefs, ref);
+    return s1 !== null ? `${pre}${head} [seq ${s1}]` : full;
+  });
   const lines = [report];
   if (args.scope === void 0) {
     const nudge = turn.nudge;
@@ -9601,9 +9710,27 @@ var AcpCompactionEngine = class extends CompactionEngine {
       settingsCommand: this.settingsCommand
     };
     this.env = env;
+    const registerToolsOn = (registry3) => {
+      const disposers = [];
+      for (const tool of makeTools(env)) {
+        try {
+          disposers.push(registry3.register(tool));
+        } catch (err) {
+          this.ctx.logger.warn(`billion-context-dsh: failed to register tool ${tool.name}: ${String(err)}`);
+        }
+      }
+      ctx.effect(() => () => {
+        for (const d of disposers) {
+          try {
+            d?.();
+          } catch {
+          }
+        }
+      }, "billion-context-dsh: model tools");
+    };
     const tools = ctx.get("tools");
     if (tools !== void 0) {
-      for (const tool of makeTools(env)) tools.register(tool);
+      registerToolsOn(tools);
     } else {
       let done = false;
       const registerTools = () => {
@@ -9611,15 +9738,36 @@ var AcpCompactionEngine = class extends CompactionEngine {
         const registry3 = ctx.get("tools");
         if (registry3 === void 0) return;
         done = true;
-        for (const tool of makeTools(env)) registry3.register(tool);
+        registerToolsOn(registry3);
       };
       ctx.on("internal/service", (name) => {
         if (name === "tools") registerTools();
       });
     }
+    ctx.on("internal/service", (name) => {
+      if (name === "tools") {
+        const registry3 = ctx.get("tools");
+        if (registry3 !== void 0 && registry3.get("compress") === void 0) {
+          registerToolsOn(registry3);
+        }
+      }
+    });
+    const registerCommandOn = (registry3) => {
+      try {
+        const d = registry3.register(acpCommand(env));
+        ctx.effect(() => () => {
+          try {
+            d?.();
+          } catch {
+          }
+        }, "billion-context-dsh: command");
+      } catch (err) {
+        this.ctx.logger.warn(`billion-context-dsh: failed to register command: ${String(err)}`);
+      }
+    };
     const commands = ctx.get("commands");
     if (commands !== void 0) {
-      commands.register(acpCommand(env));
+      registerCommandOn(commands);
     } else {
       let done = false;
       const registerCommand = () => {
@@ -9627,7 +9775,7 @@ var AcpCompactionEngine = class extends CompactionEngine {
         const registry3 = ctx.get("commands");
         if (registry3 === void 0) return;
         done = true;
-        registry3.register(acpCommand(env));
+        registerCommandOn(registry3);
       };
       ctx.on("internal/service", (name) => {
         if (name === "commands") registerCommand();
